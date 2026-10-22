@@ -1,0 +1,250 @@
+import numpy as np
+from scipy import stats
+
+
+def calcular_densidade(distribuicao, tamanho_grade,
+                       taxa_exponencial=1.0,
+                       media_normal=0.5,
+                       desvio_padrao_normal=0.15):
+    """
+    Calcula e normaliza uma densidade de probabilidade em uma
+    grade uniforme no intervalo [0, 1].
+
+    Parâmetros
+    ----------
+    distribuicao : str
+        Distribuição utilizada: 'unif', 'exp' ou 'norm'.
+    tamanho_grade : int
+        Número de pontos da grade.
+    taxa_exponencial : float
+        Parâmetro da distribuição exponencial.
+    media_normal : float
+        Média da distribuição normal.
+    desvio_padrao_normal : float
+        Desvio padrão da distribuição normal.
+
+    Retorna
+    -------
+    numpy.ndarray
+        Vetor com os valores normalizados da densidade.
+    """
+    passo_grade = 1.0 / tamanho_grade
+    pontos_grade = (
+        np.arange(tamanho_grade) + 0.5
+    ) * passo_grade
+
+    if distribuicao == "exp":
+        densidade = (
+            taxa_exponencial
+            * np.exp(-taxa_exponencial * pontos_grade)
+            / (1 - np.exp(-taxa_exponencial))
+        )
+
+    elif distribuicao == "norm":
+        densidade = stats.norm.pdf(
+            pontos_grade,
+            loc=media_normal,
+            scale=desvio_padrao_normal
+        )
+
+    elif distribuicao == "unif":
+        densidade = np.ones(tamanho_grade)
+
+    else:
+        raise ValueError(
+            f"Distribuição não reconhecida: {distribuicao!r}"
+        )
+
+    # Normaliza a densidade por meio da soma de Riemann.
+    densidade /= densidade.sum() * passo_grade
+
+    return densidade
+
+
+def calcular_probabilidades_teoricas(
+    distribuicao,
+    tamanho_grade,
+    numero_maximo_termos=9,
+    **parametros_distribuicao
+):
+    """
+    Calcula as probabilidades teóricas por meio de uma recursão
+    numérica em uma grade uniforme.
+
+    Parâmetros
+    ----------
+    distribuicao : str
+        Distribuição utilizada: 'unif', 'exp' ou 'norm'.
+    tamanho_grade : int
+        Número de pontos da grade.
+    numero_maximo_termos : int
+        Número de probabilidades a serem calculadas.
+    **parametros_distribuicao
+        Parâmetros adicionais da distribuição.
+
+    Retorna
+    -------
+    numpy.ndarray
+        Aproximações de P_G^(n), para n = 1, ..., numero_maximo_termos.
+    """
+    passo_grade = 1.0 / tamanho_grade
+
+    densidade = calcular_densidade(
+        distribuicao,
+        tamanho_grade,
+        **parametros_distribuicao
+    )
+
+    tamanho_vetores = numero_maximo_termos * tamanho_grade + 1
+
+    # Distribuição acumulada aproximada da densidade inicial.
+    distribuicao_acumulada = np.cumsum(densidade) * passo_grade
+
+    # Densidade inicial associada ao mínimo de dois pesos
+    # independentes com a mesma distribuição.
+    densidade_atual = np.zeros(tamanho_vetores)
+    densidade_atual[:tamanho_grade] = (
+        2.0 * (1.0 - distribuicao_acumulada) * densidade
+    )
+
+    sequencia_atual = densidade_atual.copy()
+
+    probabilidades_calculadas = [
+        sequencia_atual.sum() * passo_grade
+    ]
+
+    indices_grade = np.arange(tamanho_grade)
+
+    for _ in range(1, numero_maximo_termos):
+
+        # Integral acumulada da densidade auxiliar atual.
+        integral_acumulada = (
+            np.cumsum(densidade_atual) * passo_grade
+        )
+
+        proxima_sequencia = np.zeros(tamanho_vetores)
+
+        for indice_custo in range(tamanho_vetores):
+
+            indices_anteriores = indice_custo - indices_grade
+            indices_validos = indices_anteriores >= 0
+
+            indices_seguros = np.where(
+                indices_validos,
+                indices_anteriores,
+                0
+            )
+
+            valores_integral = np.where(
+                indices_validos,
+                integral_acumulada[indices_seguros],
+                0.0
+            )
+
+            # Aproxima a integral de f(y) * [1 - H(c-y)]
+            # para y >= x, utilizando somas acumuladas reversas.
+            integral_cauda = (
+                np.cumsum(
+                    (
+                        densidade * (1.0 - valores_integral)
+                    )[::-1]
+                )[::-1]
+                * passo_grade
+            )
+
+            valores_sequencia = np.where(
+                indices_validos,
+                sequencia_atual[indices_seguros],
+                0.0
+            )
+
+            proxima_sequencia[indice_custo] = (
+                2.0
+                * np.sum(
+                    densidade
+                    * valores_sequencia
+                    * integral_cauda
+                )
+                * passo_grade
+            )
+
+        # Calcula a densidade da soma de duas variáveis
+        # por meio de uma convolução discreta.
+        densidade_soma = np.convolve(
+            densidade,
+            densidade_atual
+        )[:tamanho_vetores] * passo_grade
+
+        distribuicao_acumulada_soma = (
+            np.cumsum(densidade_soma) * passo_grade
+        )
+
+        # Atualiza a densidade auxiliar para a próxima iteração.
+        densidade_atual = (
+            2.0
+            * (1.0 - distribuicao_acumulada_soma)
+            * densidade_soma
+        )
+
+        sequencia_atual = proxima_sequencia
+
+        probabilidades_calculadas.append(
+            sequencia_atual.sum() * passo_grade
+        )
+
+    return np.array(probabilidades_calculadas)
+
+
+if __name__ == "__main__":
+
+    tamanhos_grade = (500, 1000)
+
+    distribuicoes = {
+        "unif": {},
+        "exp": {"taxa_exponencial": 1.0},
+        "norm": {},
+    }
+
+    resultados_extrapolados = {}
+
+    for nome_distribuicao, parametros in distribuicoes.items():
+
+        # Calcula as probabilidades em duas resoluções.
+        resultados_grade_menor = calcular_probabilidades_teoricas(
+            nome_distribuicao,
+            tamanhos_grade[0],
+            **parametros
+        )
+
+        resultados_grade_maior = calcular_probabilidades_teoricas(
+            nome_distribuicao,
+            tamanhos_grade[1],
+            **parametros
+        )
+
+        # Extrapolação de Richardson para erro de primeira ordem.
+        probabilidades_extrapoladas = (
+            2.0 * resultados_grade_maior
+            - resultados_grade_menor
+        )
+
+        resultados_extrapolados[nome_distribuicao] = (
+            probabilidades_extrapoladas
+        )
+
+        print(
+            f"Distribuição: {nome_distribuicao}\n"
+            f"  Grade {tamanhos_grade[0]}: "
+            f"{np.round(resultados_grade_menor[:3], 5)}\n"
+            f"  Grade {tamanhos_grade[1]}: "
+            f"{np.round(resultados_grade_maior[:3], 5)}\n"
+            f"  Extrapolação: "
+            f"{np.round(probabilidades_extrapoladas, 5)}",
+            flush=True
+        )
+
+    # Salva os resultados para análises posteriores.
+    np.savez(
+        "resultados_teoricos.npz",
+        **resultados_extrapolados
+    )
