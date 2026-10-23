@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""
+Comparação de heurísticas no TSP: Greedy, Lookahead-N e A*.
+
+Para cada n (número de cidades) são geradas R instâncias aleatórias. O custo ótimo de
+referência é obtido pelo A* com heurística admissível (MST), validado contra força bruta
+em --teste. Para cada heurística medem-se a taxa de obtenção do ótimo, o gap médio ao
+ótimo, o tempo médio e, no A*, o número de nós expandidos.
+
+Modelos de instância:
+  iid         distâncias simétricas i.i.d. (uniforme, normal truncada ou exponencial
+              truncada em [0,1]), coerente com o modelo probabilístico do resumo;
+  euclidiano  cidades uniformes no quadrado unitário.
+
+Exemplos:
+  python tsp_heuristicas.py --teste
+  python tsp_heuristicas.py --n 4 5 6 7 8 9 10 --instancias 200 --dist normal
+  python tsp_heuristicas.py --n 6 8 10 12 --modelo euclidiano --lookahead 2 3 --peso-astar 1.5
+
+No Colab/Jupyter, cole o arquivo em uma célula e rode-a (ele usa os valores padrão), ou
+chame diretamente, em outra célula:
+  linhas = experimento([4,5,6,7,8], 100, "iid", "normal", [2,3], 1.0, 1, 2_000_000)
+  grafico(linhas, "resultados_tsp.png", "TSP")
+"""
+import argparse
+import csv
+import heapq
+import itertools
+import math
+import time
+
+import numpy as np
+from scipy.special import ndtr, ndtri
+
+INF = float("inf")
+TOL = 1e-9
+
+
+# ----------------------------------------------------------------------------
+# Instâncias
+# ----------------------------------------------------------------------------
+def amostra(dist, rng, size, lam=1.0, mu=0.5, sig=0.15):
+    """Pesos em [0,1] por inversão da CDF (uniforme, normal ou exponencial truncadas)."""
+    u = rng.random(size)
+    if dist == "uniforme":
+        return u
+    if dist == "exponencial":
+        return -np.log1p(-u * (1 - math.exp(-lam))) / lam
+    a, b = ndtr((0 - mu) / sig), ndtr((1 - mu) / sig)
+    return mu + sig * ndtri(a + u * (b - a))
+
+
+def instancia(n, modelo, dist, rng):
+    """Matriz de distâncias simétrica n x n."""
+    if modelo == "euclidiano":
+        p = rng.random((n, 2))
+        return np.linalg.norm(p[:, None] - p[None], axis=2)
+    w = np.triu(amostra(dist, rng, (n, n)), 1)
+    return w + w.T
+
+
+# ----------------------------------------------------------------------------
+# Heurísticas (todas partem da cidade 0 e retornam a ela)
+# ----------------------------------------------------------------------------
+def guloso(d):
+    """Vizinho mais próximo: em cada nível escolhe a aresta de menor custo local."""
+    atual, nao, custo = 0, set(range(1, len(d))), 0.0
+    while nao:
+        j = min(nao, key=lambda k: d[atual, k])
+        custo += d[atual, j]
+        atual = j
+        nao.remove(j)
+    return custo + d[atual, 0]
+
+
+def lookahead(d, N):
+    """Lookahead-N: a cada passo avalia todos os caminhos de N passos à frente e executa
+    o primeiro passo do de menor custo acumulado (Greedy corresponde a N = 1). Se a
+    janela cobre todas as cidades restantes, inclui a volta à cidade 0."""
+    atual, nao, custo = 0, set(range(1, len(d))), 0.0
+    while nao:
+        k = min(N, len(nao))
+        melhor, melhor_c = None, INF
+        for perm in itertools.permutations(nao, k):
+            c = d[atual, perm[0]] + sum(d[perm[i], perm[i + 1]] for i in range(k - 1))
+            if k == len(nao):
+                c += d[perm[-1], 0]
+            if c < melhor_c:
+                melhor_c, melhor = c, perm[0]
+        custo += d[atual, melhor]
+        atual = melhor
+        nao.remove(melhor)
+    return custo + d[atual, 0]
+
+
+def mst(d, nos):
+    """Custo da árvore geradora mínima (Prim) sobre os vértices `nos`."""
+    k = len(nos)
+    if k <= 1:
+        return 0.0
+    sub = d[np.ix_(nos, nos)]
+    usado = np.zeros(k, dtype=bool)
+    usado[0] = True
+    dist = sub[0].copy()
+    total = 0.0
+    for _ in range(k - 1):
+        m = np.where(usado, INF, dist)
+        j = int(m.argmin())
+        total += m[j]
+        usado[j] = True
+        dist = np.minimum(dist, sub[j])
+    return total
+
+
+def astar(d, w=1.0, max_nos=2_000_000):
+    """A* sobre estados (conjunto visitado, cidade atual) com f = g + w*h, em que h é o
+    custo da MST sobre {atual} U {não visitadas} U {0}: um limite inferior admissível
+    para o restante do passeio (qualquer caminho hamiltoniano é uma árvore geradora).
+    Com w = 1 o resultado é ótimo; com w > 1 (A* ponderado) deixa de ser garantido.
+    Retorna (custo, nós expandidos) ou (None, expandidos) se max_nos for excedido."""
+    n = len(d)
+    cheio = (1 << n) - 1
+    cache = {}
+
+    def h(mask, cur):
+        chave = (mask, cur)
+        if chave not in cache:
+            if mask == cheio:
+                cache[chave] = d[cur, 0]
+            else:
+                nos = [cur, 0] + [j for j in range(1, n) if not mask >> j & 1]
+                cache[chave] = mst(d, nos)
+        return cache[chave]
+
+    inicio = (1, 0)
+    melhor_g = {inicio: 0.0}
+    heap = [(w * h(*inicio), 0.0, 1, 0)]
+    expandidos = 0
+    while heap:
+        _, g, mask, cur = heapq.heappop(heap)
+        if g > melhor_g.get((mask, cur), INF) + TOL:
+            continue
+        if mask == cheio:
+            return g + d[cur, 0], expandidos
+        expandidos += 1
+        if expandidos > max_nos:
+            return None, expandidos
+        for j in range(1, n):
+            if mask >> j & 1:
+                continue
+            m2, g2 = mask | (1 << j), g + d[cur, j]
+            if g2 < melhor_g.get((m2, j), INF) - TOL:
+                melhor_g[(m2, j)] = g2
+                heapq.heappush(heap, (g2 + w * h(m2, j), g2, m2, j))
+    return None, expandidos
+
+
+def forca_bruta(d):
+    n = len(d)
+    return min(
+        d[0, p[0]] + sum(d[p[i], p[i + 1]] for i in range(n - 2)) + d[p[-1], 0]
+        for p in itertools.permutations(range(1, n))
+    )
+
+
+# ----------------------------------------------------------------------------
+# Experimento
+# ----------------------------------------------------------------------------
+def experimento(ns, R, modelo, dist, lookaheads, peso, seed, max_nos):
+    linhas = []
+    for n in ns:
+        rng = np.random.default_rng([seed, n])
+        nomes = ["Greedy"] + [f"Lookahead-{N}" for N in lookaheads] + ["A*"]
+        if peso != 1.0:
+            nomes.append(f"A* ponderado (w={peso:g})")
+        acertos = {m: 0 for m in nomes}
+        gaps = {m: [] for m in nomes}
+        tempos = {m: [] for m in nomes}
+        nos = {m: [] for m in nomes}
+        validas = 0
+        for _ in range(R):
+            d = instancia(n, modelo, dist, rng)
+            t = time.perf_counter()
+            opt, exp_ref = astar(d, 1.0, max_nos)
+            t_ref = time.perf_counter() - t
+            if opt is None:  # A* excedeu o limite: instância descartada
+                continue
+            validas += 1
+            resultados = {"A*": (opt, t_ref, exp_ref)}
+            t = time.perf_counter(); c = guloso(d)
+            resultados["Greedy"] = (c, time.perf_counter() - t, None)
+            for N in lookaheads:
+                t = time.perf_counter(); c = lookahead(d, N)
+                resultados[f"Lookahead-{N}"] = (c, time.perf_counter() - t, None)
+            if peso != 1.0:
+                t = time.perf_counter(); c, e = astar(d, peso, max_nos)
+                resultados[nomes[-1]] = (c if c is not None else INF, time.perf_counter() - t, e)
+            for m in nomes:
+                c, tm, e = resultados[m]
+                acertos[m] += c <= opt * (1 + TOL)
+                gaps[m].append(100 * (c - opt) / opt if opt > 0 else 0.0)
+                tempos[m].append(1000 * tm)
+                if e is not None:
+                    nos[m].append(e)
+        for m in nomes:
+            p = acertos[m] / validas if validas else float("nan")
+            linhas.append(dict(
+                n=n, heuristica=m, instancias=validas, taxa_otimo=p,
+                erro_padrao=math.sqrt(p * (1 - p) / validas) if validas else float("nan"),
+                gap_medio_pct=float(np.mean(gaps[m])), tempo_medio_ms=float(np.mean(tempos[m])),
+                nos_expandidos=float(np.mean(nos[m])) if nos[m] else float("nan")))
+        print(f"n={n:2d} | " + " | ".join(
+            f"{l['heuristica']}: {100 * l['taxa_otimo']:5.1f}%" for l in linhas[-len(nomes):]),
+            flush=True)
+    return linhas
+
+
+def grafico(linhas, caminho, titulo):
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    virg = FuncFormatter(lambda v, _: f"{v:g}".replace(".", ","))
+    plt.rcParams.update({"font.size": 12})
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.4))
+    for m in dict.fromkeys(l["heuristica"] for l in linhas):
+        ls = [l for l in linhas if l["heuristica"] == m]
+        x = [l["n"] for l in ls]
+        a1.errorbar(x, [l["taxa_otimo"] for l in ls], [l["erro_padrao"] for l in ls],
+                    marker="o", capsize=2, label=m)
+        if not math.isnan(ls[0]["nos_expandidos"]):
+            a2.plot(x, [l["nos_expandidos"] for l in ls], marker="s", label=m)
+    a1.set_xlabel("$n$ (número de cidades)"); a1.set_ylabel("Taxa de obtenção do ótimo")
+    a1.yaxis.set_major_formatter(virg); a1.grid(alpha=.3); a1.legend(fontsize=9)
+    a2.set_yscale("log"); a2.set_xlabel("$n$ (número de cidades)")
+    a2.set_ylabel("Nós expandidos pelo A*"); a2.grid(alpha=.3, which="both"); a2.legend(fontsize=9)
+    fig.suptitle(titulo, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(caminho, dpi=200)
+    print("Figura salva em", caminho)
+    plt.show()
+
+
+def teste():
+    rng = np.random.default_rng(0)
+    for n in (4, 5, 6, 7, 8):
+        for modelo in ("iid", "euclidiano"):
+            for _ in range(20):
+                d = instancia(n, modelo, "uniforme", rng)
+                a, _ = astar(d)
+                assert abs(a - forca_bruta(d)) < 1e-9, (n, modelo)
+                assert guloso(d) >= a - 1e-9 and abs(lookahead(d, 1) - guloso(d)) < 1e-9
+                assert abs(lookahead(d, n - 1) - a) < 1e-9  # janela cobre todo o passeio
+    print("Testes OK: A* = força bruta; Lookahead-1 = Greedy; Lookahead-(n-1) = ótimo.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--n", type=int, nargs="+", default=[4, 5, 6, 7, 8, 9, 10])
+    ap.add_argument("--instancias", type=int, default=200, help="instâncias por n")
+    ap.add_argument("--modelo", choices=["iid", "euclidiano"], default="iid")
+    ap.add_argument("--dist", choices=["uniforme", "normal", "exponencial"], default="uniforme",
+                    help="distribuição dos pesos (modelo iid)")
+    ap.add_argument("--lookahead", type=int, nargs="+", default=[2, 3])
+    ap.add_argument("--peso-astar", type=float, default=1.0, help="w > 1 inclui o A* ponderado")
+    ap.add_argument("--max-nos", type=int, default=2_000_000, help="limite de nós expandidos do A*")
+    ap.add_argument("--semente", type=int, default=1)
+    ap.add_argument("--saida", default="resultados_tsp", help="prefixo dos arquivos de saída")
+    ap.add_argument("--teste", action="store_true", help="valida as implementações e sai")
+    a, _ = ap.parse_known_args()  # ignora argumentos extras do Colab/Jupyter (-f ...)
+    if a.teste:
+        return teste()
+    linhas = experimento(a.n, a.instancias, a.modelo, a.dist, a.lookahead,
+                         a.peso_astar, a.semente, a.max_nos)
+    with open(a.saida + ".csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(linhas[0]))
+        w.writeheader(); w.writerows(linhas)
+    print("Tabela salva em", a.saida + ".csv")
+    desc = a.modelo if a.modelo == "euclidiano" else f"pesos i.i.d. {a.dist}"
+    grafico(linhas, a.saida + ".png", f"TSP, {desc}, {a.instancias} instâncias por n")
+
+
+if __name__ == "__main__":
+    main()
